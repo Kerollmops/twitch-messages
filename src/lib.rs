@@ -95,6 +95,10 @@ impl Index {
         self.env.read_txn()
     }
 
+    pub fn new_segment_notifier(&self) -> Arc<SignalEvent> {
+        self.new_segment_notifier.clone()
+    }
+
     fn increment_segment_id(&self, wtxn: &mut RwTxn) -> anyhow::Result<SegmentId> {
         let new_segment_id = match self.main.get(wtxn, main_keys::SEGMENT_ID)? {
             Some(bytes) => bytes.try_into().map(SegmentId::from_be_bytes)? + 1,
@@ -104,13 +108,13 @@ impl Index {
         Ok(new_segment_id)
     }
 
-    fn segment_total_size(&self, rtxn: &RoTxn, segment_id: SegmentId) -> heed::Result<u64> {
+    pub fn segment_total_size(&self, rtxn: &RoTxn, segment_id: SegmentId) -> heed::Result<u64> {
         self.messages
             .get(rtxn, segment_id.to_be_bytes())
             .map(|bytes| bytes.map_or(0, |b| b.len() as u64))
     }
 
-    fn segments_ids<'txn>(&self, rtxn: &'txn RoTxn) -> heed::Result<SegmentsIdsIter<'txn>> {
+    pub fn segments_ids<'txn>(&self, rtxn: &'txn RoTxn) -> heed::Result<SegmentsIdsIter<'txn>> {
         self.marker.iter(rtxn).map(SegmentsIdsIter::new)
     }
 
@@ -180,7 +184,7 @@ impl Index {
         wtxn: &mut RwTxn,
         range: Vec<SegmentId>,
         messages: File,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<SegmentId>> {
         match range.first().copied() {
             Some(first_segment_id) => {
                 self.remove_segments(wtxn, range)?;
@@ -190,9 +194,9 @@ impl Index {
                 self.marker.put(wtxn, first_segment_id_bytes, [])?;
                 self.messages.put(wtxn, first_segment_id_bytes, messages_bytes)?;
 
-                Ok(())
+                Ok(Some(first_segment_id))
             }
-            None => Ok(()),
+            None => Ok(None),
         }
     }
 
@@ -305,11 +309,12 @@ fn compact_segments(index: &Index) -> anyhow::Result<()> {
             }
         }
 
-        eprintln!("Compating from segments {:?}", segments_ids);
-
         let merged_file = merge_messages(messages)?;
         let mut wtxn = index.write_txn()?;
-        index.replace_segments(&mut wtxn, segments_ids, merged_file)?;
+        eprintln!("Compacting segments {:?}", segments_ids);
+        if let Some(segment_id) = index.replace_segments(&mut wtxn, segments_ids, merged_file)? {
+            eprintln!("Compacted segment {:?}", segment_id);
+        }
         wtxn.commit()?;
 
         Ok(())
