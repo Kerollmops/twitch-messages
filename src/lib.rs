@@ -200,9 +200,9 @@ impl Index {
         }
     }
 
-    pub fn inner_iter<F>(&self, rtxn: &RoTxn, mut f: F) -> anyhow::Result<()>
+    pub fn inner_iter<F, E>(&self, rtxn: &RoTxn, mut f: F) -> anyhow::Result<Result<(), E>>
     where
-        F: FnMut(u64, UserMessage) -> bool,
+        F: FnMut(u64, UserMessage) -> Result<bool, E>,
     {
         for result in self.messages.iter(rtxn)? {
             let (_segment_id, grenad_bytes) = result?;
@@ -214,14 +214,16 @@ impl Index {
                 let messages_obkv = KvReaderU32::new(same_msgs_obkvs);
                 for (_, message_bytes) in messages_obkv.iter() {
                     let message = UserMessage::from_obkv(message_bytes);
-                    if !(f)(timestamp, message) {
-                        return Ok(());
+                    match (f)(timestamp, message) {
+                        Ok(must_continue) if !must_continue => return Ok(Ok(())),
+                        Ok(_must_continue) => (),
+                        Err(e) => return Ok(Err(e)),
                     }
                 }
             }
         }
 
-        Ok(())
+        Ok(Ok(()))
     }
 }
 
@@ -316,6 +318,8 @@ fn compact_segments(index: &Index) -> anyhow::Result<()> {
             eprintln!("Compacted segment {:?}", segment_id);
         }
         wtxn.commit()?;
+
+        index.new_segment_notifier.signal();
 
         Ok(())
     })
@@ -417,9 +421,9 @@ impl TimedUserMessage {
 
 #[derive(Debug, PartialOrd, Ord, PartialEq, Eq, Hash)]
 pub struct UserMessage<'a> {
-    channel: &'a str,
-    login: &'a str,
-    text: &'a str,
+    pub channel: &'a str,
+    pub login: &'a str,
+    pub text: &'a str,
 }
 
 impl<'a> UserMessage<'a> {

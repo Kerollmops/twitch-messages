@@ -1,3 +1,4 @@
+use std::io;
 use std::path::PathBuf;
 
 use byte_unit::Byte;
@@ -34,11 +35,18 @@ fn main() -> anyhow::Result<()> {
 
     match opts.command {
         SubCommand::PrintAllMessages => {
+            let stdout = io::stdout();
+            let mut writer = csv::Writer::from_writer(stdout);
+            writer.write_record(&["timestamp", "channel", "login", "text"][..])?;
+
             let rtxn = index.read_txn()?;
             index.inner_iter(&rtxn, |timestamp, msg| {
-                println!("{} - {:?}", timestamp, msg);
-                true
-            })?;
+                let timestamp = timestamp.to_string();
+                writer.write_record(&[timestamp.as_str(), msg.channel, msg.login, msg.text][..])?;
+                Ok(true) as io::Result<_>
+            })??;
+
+            writer.flush()?;
         }
         SubCommand::PrintAllSegments => {
             let rtxn = index.read_txn()?;
