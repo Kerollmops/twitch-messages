@@ -32,6 +32,7 @@ fn main() -> anyhow::Result<()> {
 
     let options = EnvOpenOptions::new();
     let (_, index) = Index::open(options, opts.database_path)?;
+    let _cleared_readers = index.clear_stale_reader()?;
 
     match opts.command {
         SubCommand::PrintAllMessages => {

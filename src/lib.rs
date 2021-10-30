@@ -79,6 +79,7 @@ impl Index {
         let index_cloned = index.clone();
         std::thread::spawn(move || loop {
             new_segment_notifier.wait();
+            let _ = index_cloned.clear_stale_reader();
             if let Err(e) = compact_segments(&index_cloned) {
                 eprintln!("while trying to compact: {}", e);
             }
@@ -97,6 +98,10 @@ impl Index {
 
     pub fn new_segment_notifier(&self) -> Arc<SignalEvent> {
         self.new_segment_notifier.clone()
+    }
+
+    pub fn clear_stale_reader(&self) -> heed::Result<usize> {
+        self.env.clear_stale_readers()
     }
 
     fn increment_segment_id(&self, wtxn: &mut RwTxn) -> anyhow::Result<SegmentId> {
@@ -265,7 +270,7 @@ fn start_receiving_task(index: Index) -> crossbeam_channel::Sender<TimedUserMess
                 }
             };
 
-            if must_flush {
+            if must_flush && inserted_msgs != 0 {
                 let mut wtxn = index.write_txn().unwrap();
                 let segment_id = index.increment_segment_id(&mut wtxn).unwrap();
                 let segment_id_bytes = segment_id.to_be_bytes();
@@ -298,8 +303,10 @@ fn start_receiving_task(index: Index) -> crossbeam_channel::Sender<TimedUserMess
 fn compact_segments(index: &Index) -> anyhow::Result<()> {
     let rtxn = index.read_txn()?;
     let ranges = index.ranges_of_segments_to_compact(&rtxn)?;
+    drop(rtxn);
 
     ranges.into_par_iter().try_for_each_with(index.clone(), |index, range| {
+        let rtxn = index.read_txn()?;
         let mut segments_ids = Vec::new();
         let mut messages = Vec::new();
         for segment_id in range {
@@ -312,14 +319,15 @@ fn compact_segments(index: &Index) -> anyhow::Result<()> {
         }
 
         let merged_file = merge_messages(messages)?;
+        drop(rtxn);
+
         let mut wtxn = index.write_txn()?;
         eprintln!("Compacting segments {:?}", segments_ids);
         if let Some(segment_id) = index.replace_segments(&mut wtxn, segments_ids, merged_file)? {
             eprintln!("Compacted segment {:?}", segment_id);
+            index.new_segment_notifier.signal();
         }
         wtxn.commit()?;
-
-        index.new_segment_notifier.signal();
 
         Ok(())
     })
