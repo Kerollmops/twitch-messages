@@ -7,12 +7,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::RecvTimeoutError;
+use fst::IntoStreamer;
 use grenad::CompressionType::Snappy;
 use heed::{RoTxn, RwTxn};
 use obkv::{KvReaderU32, KvWriterU32};
 use ordered_float::NotNan;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use synchronoise::event::SignalEvent;
+use unicode_segmentation::UnicodeSegmentation;
+use unidecode::unidecode;
 
 pub use crate::message::TimedUserMessage;
 use crate::message::{obkv_messages_from_msg, UserMessage};
@@ -23,11 +26,13 @@ mod segments_ids_iter;
 
 type SegmentId = u32;
 
+/// This represent 1 GiB.
+const ONE_GIB: usize = 1 * 1024 * 1024 * 1024;
 /// This represent 2 GiB.
-const TWO_GIB: usize = 2 * 1024 * 1024 * 1024;
+const TWO_GIB: usize = 2 * ONE_GIB;
 
 /// Number of messages before hard-flushing.
-const FLUSH_MESSAGES_COUNT: usize = 1000;
+const FLUSH_MESSAGES_COUNT: usize = 10_000;
 
 /// The number of segments we merge in one batch.
 const MERGE_FACTOR: usize = 8;
@@ -45,6 +50,7 @@ mod db_names {
     pub const MAIN: &str = "main";
     pub const MARKER: &str = "marker";
     pub const MESSAGES: &str = "messages";
+    pub const TERMS: &str = "terms";
 }
 
 #[derive(Clone)]
@@ -53,6 +59,7 @@ pub struct Index {
     main: heed::Database,
     marker: heed::Database,
     messages: heed::Database,
+    terms: heed::Database,
     new_segment_notifier: Arc<SignalEvent>,
 }
 
@@ -61,11 +68,12 @@ impl Index {
         mut options: heed::EnvOpenOptions,
         path: P,
     ) -> heed::Result<(crossbeam_channel::Sender<TimedUserMessage>, Index)> {
-        options.max_dbs(3);
+        options.max_dbs(4);
         let env = options.open(path)?;
         let main = env.create_database(Some(db_names::MAIN))?;
         let marker = env.create_database(Some(db_names::MARKER))?;
         let messages = env.create_database(Some(db_names::MESSAGES))?;
+        let terms = env.create_database(Some(db_names::TERMS))?;
         let new_segment_notifier = Arc::new(SignalEvent::auto(true));
 
         let index = Index {
@@ -73,6 +81,7 @@ impl Index {
             main,
             marker,
             messages,
+            terms,
             new_segment_notifier: new_segment_notifier.clone(),
         };
 
@@ -115,9 +124,17 @@ impl Index {
     }
 
     pub fn segment_total_size(&self, rtxn: &RoTxn, segment_id: SegmentId) -> heed::Result<u64> {
-        self.messages
+        let messages_size = self
+            .messages
             .get(rtxn, segment_id.to_be_bytes())
-            .map(|bytes| bytes.map_or(0, |b| b.len() as u64))
+            .map(|bytes| bytes.map_or(0, |b| b.len() as u64))?;
+
+        let terms_size = self
+            .terms
+            .get(rtxn, segment_id.to_be_bytes())
+            .map(|bytes| bytes.map_or(0, |b| b.len() as u64))?;
+
+        Ok(messages_size + terms_size)
     }
 
     pub fn segments_ids<'txn>(&self, rtxn: &'txn RoTxn) -> heed::Result<SegmentsIdsIter<'txn>> {
@@ -180,25 +197,34 @@ impl Index {
             let segment_id_bytes = segment_id.to_be_bytes();
             self.marker.delete(wtxn, segment_id_bytes)?;
             self.messages.delete(wtxn, segment_id_bytes)?;
+            self.terms.delete(wtxn, segment_id_bytes)?;
         }
 
         Ok(())
     }
 
-    fn replace_segments(
+    fn replace_segments<A>(
         &self,
         wtxn: &mut RwTxn,
         range: Vec<SegmentId>,
         messages: File,
-    ) -> anyhow::Result<Option<SegmentId>> {
+        terms: fst::Set<A>,
+    ) -> anyhow::Result<Option<SegmentId>>
+    where
+        A: AsRef<[u8]>,
+    {
         match range.first().copied() {
             Some(first_segment_id) => {
                 self.remove_segments(wtxn, range)?;
 
                 let first_segment_id_bytes = first_segment_id.to_be_bytes();
-                let messages_bytes = unsafe { memmap2::Mmap::map(&messages)? };
                 self.marker.put(wtxn, first_segment_id_bytes, [])?;
+
+                let messages_bytes = unsafe { memmap2::Mmap::map(&messages)? };
                 self.messages.put(wtxn, first_segment_id_bytes, messages_bytes)?;
+
+                let terms_bytes = terms.as_fst().as_bytes();
+                self.terms.put(wtxn, first_segment_id_bytes, terms_bytes)?;
 
                 Ok(Some(first_segment_id))
             }
@@ -244,6 +270,10 @@ fn start_receiving_task(index: Index) -> crossbeam_channel::Sender<TimedUserMess
             .dump_threshold(TWO_GIB)
             .allow_realloc(false)
             .build();
+        let mut terms_sorter = grenad::Sorter::builder(ignore_value)
+            .dump_threshold(ONE_GIB)
+            .allow_realloc(false)
+            .build();
         let mut must_continue = true;
 
         while must_continue {
@@ -253,6 +283,13 @@ fn start_receiving_task(index: Index) -> crossbeam_channel::Sender<TimedUserMess
                     // We ignore timestamp below 0.
                     if let Ok(timestamp) = TryInto::<u64>::try_into(timestamp) {
                         let msg = timed_msg.user_message();
+
+                        // Extract the unidecoded words form the messages texts.
+                        for word in msg.text.unicode_words() {
+                            let word = unidecode(word);
+                            terms_sorter.insert(word, []).unwrap();
+                        }
+
                         one_msg_buffer.clear();
                         all_msg_buffer.clear();
                         let obkv =
@@ -288,8 +325,23 @@ fn start_receiving_task(index: Index) -> crossbeam_channel::Sender<TimedUserMess
                 let grenad_messages_file = grenad_writer.into_inner().unwrap();
                 let grenad_messages = unsafe { memmap2::Mmap::map(&grenad_messages_file).unwrap() };
 
+                let terms_file = tempfile::tempfile().unwrap();
+                let mut terms_builder = fst::SetBuilder::new(terms_file).unwrap();
+                let new_terms_sorter = grenad::Sorter::builder(ignore_value)
+                    .dump_threshold(ONE_GIB)
+                    .allow_realloc(false)
+                    .build();
+                let terms_sorter = mem::replace(&mut terms_sorter, new_terms_sorter);
+                let mut terms_iter = terms_sorter.into_stream_merger_iter().unwrap();
+                while let Some((word, _)) = terms_iter.next().unwrap() {
+                    terms_builder.insert(word).unwrap();
+                }
+                let terms_file = terms_builder.into_inner().unwrap();
+                let terms_bytes = unsafe { memmap2::Mmap::map(&terms_file).unwrap() };
+
                 index.marker.put(&mut wtxn, segment_id_bytes, []).unwrap();
                 index.messages.put(&mut wtxn, segment_id_bytes, grenad_messages).unwrap();
+                index.terms.put(&mut wtxn, segment_id_bytes, terms_bytes).unwrap();
 
                 inserted_msgs = 0;
                 wtxn.commit().unwrap();
@@ -307,10 +359,11 @@ fn compact_segments(index: &Index) -> anyhow::Result<()> {
     drop(rtxn);
 
     ranges.into_par_iter().try_for_each_with(index.clone(), |index, range| {
+        // Merge the messages.
         let rtxn = index.read_txn()?;
         let mut segments_ids = Vec::new();
         let mut messages = Vec::new();
-        for segment_id in range {
+        for segment_id in range.iter().copied() {
             if let Some(message_bytes) = index.messages.get(&rtxn, segment_id.to_be_bytes())? {
                 let message_cursor = Cursor::new(message_bytes);
                 let reader = grenad::Reader::new(message_cursor)?;
@@ -319,12 +372,35 @@ fn compact_segments(index: &Index) -> anyhow::Result<()> {
             }
         }
 
-        let merged_file = merge_messages(messages)?;
+        let new_file = merge_messages(messages)?;
+
+        // Merge the terms of the messages.
+        let mut terms_sets = Vec::new();
+        for segment_id in range {
+            if let Some(terms_bytes) = index.terms.get(&rtxn, segment_id.to_be_bytes())? {
+                let set = fst::Set::new(terms_bytes)?;
+                terms_sets.push(set);
+            }
+        }
+
+        let mut op = fst::set::OpBuilder::new();
+        for set in terms_sets.iter() {
+            op.push(set.into_stream());
+        }
+
+        let terms_file = tempfile::tempfile()?;
+        let mut terms_builder = fst::SetBuilder::new(terms_file)?;
+        terms_builder.extend_stream(op.r#union())?;
+        let terms_file = terms_builder.into_inner()?;
+        let merged_bytes = unsafe { memmap2::Mmap::map(&terms_file)? };
+        let new_terms = fst::Set::new(merged_bytes)?;
+
         drop(rtxn);
 
         let mut wtxn = index.write_txn()?;
         eprintln!("Compacting segments {:?}", segments_ids);
-        if let Some(segment_id) = index.replace_segments(&mut wtxn, segments_ids, merged_file)? {
+        let segment_id = index.replace_segments(&mut wtxn, segments_ids, new_file, new_terms)?;
+        if let Some(segment_id) = segment_id {
             eprintln!("Compacted segment {:?}", segment_id);
             index.new_segment_notifier.signal();
         }
@@ -385,4 +461,8 @@ fn multi_message_merge<'a>(_key: &[u8], values: &[Cow<'a, [u8]>]) -> anyhow::Res
     }
 
     Ok(Cow::Owned(buffer))
+}
+
+fn ignore_value<'a>(_key: &[u8], _values: &[Cow<'a, [u8]>]) -> anyhow::Result<Cow<'a, [u8]>> {
+    Ok(Cow::Borrowed(&[]))
 }

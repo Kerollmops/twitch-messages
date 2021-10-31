@@ -11,6 +11,7 @@ chrono = "0.4.19"
 clap = "3.0.0-beta.5"
 crossbeam-channel = "0.5.1"
 csv = "1.1.6"
+fst = "0.4.7"
 grenad = "0.4.1"
 heed = { git = "https://github.com/Kerollmops/heed", branch = "v0.13" }
 memmap2 = "0.5.0"
@@ -21,3 +22,5 @@ synchronoise = "1.0.0"
 tempfile = "3.2.0"
 tokio = { version = "1.13.0", features = ["full"] }
 twitch-irc = "3.0.1"
+unicode-segmentation = "1.8.0"
+unidecode = "0.3.0"
