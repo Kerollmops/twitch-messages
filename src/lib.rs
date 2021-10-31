@@ -373,6 +373,10 @@ fn multi_message_merge<'a>(_key: &[u8], values: &[Cow<'a, [u8]>]) -> anyhow::Res
         a.cmp(&b)
     });
 
+    // Remove the documents that are exactly the same, can happen when you
+    // import messages while also being subscribed to channels.
+    msg_obkvs.dedup();
+
     let mut buffer = Vec::new();
     for (i, one_msg_obkvs) in msg_obkvs.into_iter().enumerate() {
         let i = i.try_into().unwrap();
