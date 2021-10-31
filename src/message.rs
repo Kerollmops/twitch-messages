@@ -61,11 +61,11 @@ impl<'a> UserMessage<'a> {
 
     pub fn into_obkv<'b>(&self, buffer: &'b mut Vec<u8>) -> &'b [u8] {
         let start = buffer.len();
-        let mut msg_writer = KvWriterU8::new(&mut *buffer);
+        let mut msg_writer = KvWriterU8::new(buffer);
         msg_writer.insert(UserMessage::CHANNEL, self.channel).unwrap();
         msg_writer.insert(UserMessage::LOGIN, self.login).unwrap();
         msg_writer.insert(UserMessage::TEXT, self.text).unwrap();
-        msg_writer.finish().unwrap();
+        let buffer = msg_writer.into_inner().unwrap();
         &buffer[start..]
     }
 }
