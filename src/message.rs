@@ -1,6 +1,8 @@
 use std::str;
+use std::str::FromStr;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
+use csv::StringRecord;
 use obkv::{KvReaderU8, KvWriterU32, KvWriterU8};
 use twitch_irc::message::ServerMessage;
 
@@ -24,6 +26,17 @@ impl TimedUserMessage {
         } else {
             None
         }
+    }
+
+    /// Must be of the form: timestamp,channel,login,text.
+    pub fn from_string_record(record: &StringRecord) -> Option<TimedUserMessage> {
+        let timestamp = record.get(0).and_then(|f| i64::from_str(f).ok())?;
+        Some(TimedUserMessage {
+            timestamp: DateTime::from_utc(NaiveDateTime::from_timestamp(timestamp, 0), Utc),
+            channel: record.get(1)?.to_string(),
+            login: record.get(2)?.to_string(),
+            text: record.get(3)?.to_string(),
+        })
     }
 
     pub fn user_message(&self) -> UserMessage {
