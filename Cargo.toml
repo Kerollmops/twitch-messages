@@ -1,5 +1,6 @@
 [package]
 name = "twitch-messages"
+description = "A tool to subscribe to Twitch channels and store them efficiently on disk"
 version = "0.1.0"
 edition = "2021"
 
