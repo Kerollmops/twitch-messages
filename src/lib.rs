@@ -1,23 +1,24 @@
 use std::borrow::Cow;
 use std::fs::File;
 use std::io::{Cursor, Seek};
+use std::mem;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use std::{mem, str};
 
-use chrono::{DateTime, Utc};
 use crossbeam_channel::RecvTimeoutError;
 use grenad::CompressionType::Snappy;
 use heed::{RoTxn, RwTxn};
-use obkv::{KvReaderU32, KvReaderU8, KvWriterU32, KvWriterU8};
+use obkv::{KvReaderU32, KvWriterU32};
 use ordered_float::NotNan;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use synchronoise::event::SignalEvent;
-use twitch_irc::message::ServerMessage;
 
+pub use crate::message::TimedUserMessage;
+use crate::message::{obkv_messages_from_msg, UserMessage};
 use crate::segments_ids_iter::SegmentsIdsIter;
 
+mod message;
 mod segments_ids_iter;
 
 type SegmentId = u32;
@@ -380,84 +381,4 @@ fn multi_message_merge<'a>(_key: &[u8], values: &[Cow<'a, [u8]>]) -> anyhow::Res
     }
 
     Ok(Cow::Owned(buffer))
-}
-
-/// This function generates an obkv inside of another obkv.
-fn obkv_messages_from_msg<'b>(
-    msg: &UserMessage,
-    one_msg_buffer: &mut Vec<u8>,
-    all_msg_buffer: &'b mut Vec<u8>,
-) -> anyhow::Result<&'b [u8]> {
-    let start_buffer = all_msg_buffer.len();
-    let msg_bytes = msg.into_obkv(one_msg_buffer);
-    let mut all_msg_writer = KvWriterU32::new(all_msg_buffer);
-    all_msg_writer.insert(0, msg_bytes)?;
-    let all_msg_buffer = all_msg_writer.into_inner()?;
-    Ok(&all_msg_buffer[start_buffer..])
-}
-
-#[derive(Debug)]
-pub struct TimedUserMessage {
-    timestamp: DateTime<Utc>,
-    channel: String,
-    login: String,
-    text: String,
-}
-
-impl TimedUserMessage {
-    pub fn from_private_nessage(msg: ServerMessage) -> Option<TimedUserMessage> {
-        if let ServerMessage::Privmsg(msg) = msg {
-            Some(TimedUserMessage {
-                timestamp: msg.server_timestamp,
-                channel: msg.channel_login,
-                login: msg.sender.login,
-                text: msg.message_text,
-            })
-        } else {
-            None
-        }
-    }
-
-    pub fn user_message(&self) -> UserMessage {
-        UserMessage {
-            channel: self.channel.as_str(),
-            login: self.login.as_str(),
-            text: self.text.as_str(),
-        }
-    }
-}
-
-#[derive(Debug, PartialOrd, Ord, PartialEq, Eq, Hash)]
-pub struct UserMessage<'a> {
-    pub channel: &'a str,
-    pub login: &'a str,
-    pub text: &'a str,
-}
-
-impl<'a> UserMessage<'a> {
-    const CHANNEL: u8 = 0;
-    const LOGIN: u8 = 1;
-    const TEXT: u8 = 2;
-
-    fn from_obkv(bytes: &'a [u8]) -> UserMessage<'a> {
-        let obkv = KvReaderU8::new(bytes);
-        let channel = obkv.get(UserMessage::CHANNEL).unwrap();
-        let login = obkv.get(UserMessage::LOGIN).unwrap();
-        let text = obkv.get(UserMessage::TEXT).unwrap();
-        UserMessage {
-            channel: str::from_utf8(channel).unwrap(),
-            login: str::from_utf8(login).unwrap(),
-            text: str::from_utf8(text).unwrap(),
-        }
-    }
-
-    fn into_obkv<'b>(&self, buffer: &'b mut Vec<u8>) -> &'b [u8] {
-        let start = buffer.len();
-        let mut msg_writer = KvWriterU8::new(&mut *buffer);
-        msg_writer.insert(UserMessage::CHANNEL, self.channel).unwrap();
-        msg_writer.insert(UserMessage::LOGIN, self.login).unwrap();
-        msg_writer.insert(UserMessage::TEXT, self.text).unwrap();
-        msg_writer.finish().unwrap();
-        &buffer[start..]
-    }
 }
